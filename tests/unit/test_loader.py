@@ -21,11 +21,17 @@ import salt.config
 import salt.loader
 import salt.utils.files
 import salt.utils.stringutils
+
+# pylint: disable=import-error,no-name-in-module,redefined-builtin
+from salt.ext import six
+from salt.ext.six.moves import range
 from tests.support.case import ModuleCase
 from tests.support.helpers import slowTest
 from tests.support.mock import MagicMock, patch
 from tests.support.runtests import RUNTIME_VARS
-from tests.support.unit import TestCase, skipIf
+from tests.support.unit import TestCase
+
+# pylint: enable=no-name-in-module,redefined-builtin
 
 log = logging.getLogger(__name__)
 
@@ -1232,7 +1238,6 @@ class LazyLoaderDeepSubmodReloadingTest(TestCase):
                 self._verify_libs()
 
 
-@skipIf(True, "Temporarily removed the functionality")
 class LoaderMultipleGlobalTest(ModuleCase):
     """
     Tests when using multiple lazyloaders
@@ -1590,7 +1595,7 @@ class LazyLoaderOptimizationOrderTest(TestCase):
         self.loader = self._get_loader()
         filename = self._get_module_filename()
         basename = os.path.basename(filename)
-        expected = "lazyloadertest.py"
+        expected = "lazyloadertest.py" if six.PY3 else "lazyloadertest.pyc"
         assert basename == expected, basename
 
 
