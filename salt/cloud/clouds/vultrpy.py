@@ -51,6 +51,22 @@ that startup script in a profile like so:
       size: 13
       startup_script_id: 493234
 
+When using a custom image type (such as when you are installing from an ISO 
+or doing a net install), you may specify 'ssh_username' and 'password' (rather 
+than pulling them from Vultr's API). You may also specify 'ipxe_chain_url' to
+specifiy the URL of an iPXE-compatible script to chainload.
+
+.. code-block:: yaml
+
+    tor-1gb-1cpu-custom:
+      location: 22
+      provider: my-vultr-config
+      image: 159
+      size: 201
+      ssh_username: 'root'
+      password: 'CorrectHorseBatteryStaple'
+      ipxe_chain_url: 'https://some.example.com/script.ipxe'
+
 """
 
 # Import python libs
