@@ -51,10 +51,12 @@ that startup script in a profile like so:
       size: 13
       startup_script_id: 493234
 
-When using a custom image type (such as when you are installing from an ISO 
-or doing a net install), you may specify 'ssh_username' and 'password' (rather 
-than pulling them from Vultr's API). You may also specify 'ipxe_chain_url' to
-specifiy the URL of an iPXE-compatible script to chainload.
+When using a custom image type (such as when you are installing from an ISO), 
+you may specify 'ssh_username' and 'password' (rather than pulling them from 
+Vultr's API). You may also specify 'isoid' to use select either a publicly-
+available ISO image or a custom ISO image present in your account; additionally 
+you can define 'ipxe_chain_url' to specifiy the URL of an iPXE-compatible 
+script to chainload.
 
 .. code-block:: yaml
 
@@ -65,7 +67,18 @@ specifiy the URL of an iPXE-compatible script to chainload.
       size: 201
       ssh_username: 'root'
       password: 'CorrectHorseBatteryStaple'
+      isoid: 641216
       ipxe_chain_url: 'https://some.example.com/script.ipxe'
+
+You can list account-level ISO images with
+
+.. code-block:: bash
+    salt-cloud -f list_acct_isos <name of vultr provider>
+
+and public ISO images with
+
+.. code-block:: bash
+    salt-cloud -f list_public_isos <name of vultr provider>
 
 """
 
@@ -170,6 +183,33 @@ def list_scripts(conn=None, call=None):
     """
     return avail_scripts()
 
+
+def avail_acct_isos(conn=None):
+    """
+    return available ISO images in account
+    """
+    return avail_scripts()
+
+
+def list_public_isos(conn=None, call=None):
+    '''
+    return list of public ISO images
+    '''
+    return avail_firewall_groups()
+
+
+def avail_public_isos(conn=None):
+    """
+    return available public ISO images
+    """
+    return avail_scripts()
+
+
+def list_acct_isos(conn=None, call=None):
+    '''
+    return list of ISO images in account
+    '''
+    return avail_firewall_groups()
 
 def avail_sizes(conn=None):
     """
@@ -326,6 +366,13 @@ def create(vm_):
         )
         return False
 
+    if isoid and str(isoid) not in avail_public_isos() and str(isoid) not in avail_public_isos():
+        log.error(
+            "Your Vultr account does not have an ISO image with ID %s and it does not match a public ISO image",
+            str(isoid),
+        )
+        return False
+    
     if private_networking is not None:
         if not isinstance(private_networking, bool):
             raise SaltCloudConfigError(
@@ -382,6 +429,9 @@ def create(vm_):
     }
     if startup_script:
         kwargs["SCRIPTID"] = startup_script
+        
+    if isoid:
+        kwargs["ISOID"] = isoid
 
     log.info("Creating Cloud VM %s", vm_["name"])
 
