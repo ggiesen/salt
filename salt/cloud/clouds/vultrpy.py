@@ -181,35 +181,36 @@ def list_scripts(conn=None, call=None):
     """
     return list of Startup Scripts
     """
-    return avail_scripts()
+    return _query("startupscript/list")
 
 
 def avail_acct_isos(conn=None):
     """
     return available ISO images in account
     """
-    return avail_scripts()
+    return _query("iso/list")
 
 
-def list_public_isos(conn=None, call=None):
+def list_acct_isos(conn=None, call=None):
     '''
     return list of public ISO images
     '''
-    return avail_firewall_groups()
+    return avail_acct_isos()
 
 
 def avail_public_isos(conn=None):
     """
     return available public ISO images
     """
-    return avail_scripts()
+    return _query("iso/list_public")
 
 
-def list_acct_isos(conn=None, call=None):
+def list_public_isos(conn=None, call=None):
     '''
     return list of ISO images in account
     '''
-    return avail_firewall_groups()
+    return avail_public_isos()
+
 
 def avail_sizes(conn=None):
     """
