@@ -80,11 +80,25 @@ and public ISO images with
 .. code-block:: bash
     salt-cloud -f list_public_isos <name of vultr provider>
 
+You may pass metadata using Vultr's metadata service to your instance by setting 
+'userdata'. The value for 'userdata' can either be a dictionary or the path to a 
+file, in which case you can also optionally specify 'userdata_template', which 
+sets the renderer to render the file with
+
+    ams-64gb-16cpu-centos-8:
+      location: 7
+      provider: my-vultr-config
+      image: 362
+      size: 207
+      userdata: /srv/scripts/userdata.tmpl
+      userdata_template: jinja
+
 """
 
 # Import python libs
 from __future__ import absolute_import, print_function, unicode_literals
 
+import base64
 import logging
 import pprint
 import time
@@ -391,6 +405,18 @@ def create(vm_):
         )
         return False
 
+    userdata = config.get_cloud_config_value(
+        "userdata", vm_, __opts__, search_global=False, default=None
+    )
+    if userdata is not None and os.path.isfile(userdata):
+        try:
+            with __utils__["files.fopen"](userdata, "r") as fp_:
+                kwargs["userdata"] = __utils__["cloud.userdata_template"](
+                    __opts__, vm_, fp_.read()
+                )
+        except Exception as exc:  # pylint: disable=broad-except
+            log.exception("Failed to read userdata from %s: %s", userdata, exc)
+
     __utils__["cloud.fire_event"](
         "event",
         "starting create",
@@ -433,6 +459,14 @@ def create(vm_):
         
     if isoid:
         kwargs["ISOID"] = isoid
+
+    if userdata is not None:
+        try:
+            kwargs["userdata"] = base64.b64encode(
+                salt.utils.stringutils.to_bytes(userdata)
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            log.exception("Failed to encode userdata: %s", exc)
 
     log.info("Creating Cloud VM %s", vm_["name"])
 
