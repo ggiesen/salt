@@ -66,6 +66,14 @@ from salt.exceptions import SaltCloudConfigError, SaltCloudSystemExit
 from salt.ext import six
 from salt.ext.six.moves.urllib.parse import urlencode as _urlencode
 
+# Import 3rd-Party Libs
+try:
+    import validators
+
+    HAS_VALIDATORS = True
+except ImportError:
+    HAS_VALIDATORS = False
+
 # Get logging started
 log = logging.getLogger(__name__)
 
@@ -82,6 +90,14 @@ def __virtual__():
         return False
 
     return __virtualname__
+
+
+def get_dependencies():
+    """
+    Warn if dependencies aren't met.
+    """
+    deps = {"validators": HAS_VALIDATORS,}
+    return config.check_driver_dependencies(__virtualname__, deps)
 
 
 def get_configured_provider():
@@ -267,12 +283,24 @@ def create(vm_):
     if "driver" not in vm_:
         vm_["driver"] = vm_["provider"]
 
+    ssh_username = config.get_cloud_config_value(
+        "ssh_username", vm_, __opts__, search_global=False, default=False,
+    )
+
+    password = config.get_cloud_config_value(
+        "password", vm_, __opts__, search_global=False, default=False,
+    )
+
     private_networking = config.get_cloud_config_value(
         "enable_private_network", vm_, __opts__, search_global=False, default=False,
     )
 
     startup_script = config.get_cloud_config_value(
         "startup_script_id", vm_, __opts__, search_global=False, default=None,
+    )
+
+    ipxe_chain_url = config.get_cloud_config_value(
+        "ipxe_chain_url", vm_, __opts__, search_global=False, default=False,
     )
 
     if startup_script and str(startup_script) not in avail_scripts():
@@ -291,6 +319,13 @@ def create(vm_):
         enable_private_network = "yes"
     else:
         enable_private_network = "no"
+
+    if ipxe_chain_url and not validators.url(str(ipxe_chain_url)):
+        log.error(
+            "iPXE Chain URL %s is malformed",
+            str(ipxe_chain_url),
+        )
+        return False
 
     __utils__["cloud.fire_event"](
         "event",
@@ -324,7 +359,10 @@ def create(vm_):
         "VPSPLANID": vpsplanid,
         "DCID": dcid,
         "hostname": vm_["name"],
+        "ssh_username": ssh_username,
+        "password": password,
         "enable_private_network": enable_private_network,
+        "ipxe_chain_url": ipxe_chain_url,
     }
     if startup_script:
         kwargs["SCRIPTID"] = startup_script
@@ -420,7 +458,7 @@ def create(vm_):
         if six.text_type(data.get("status", "")) != "active":
             time.sleep(1)
             return False
-        return data["default_password"]
+        return data["status"]
 
     def wait_for_server_state():
         """
@@ -432,7 +470,7 @@ def create(vm_):
         if six.text_type(data.get("server_state", "")) != "ok":
             time.sleep(1)
             return False
-        return data["default_password"]
+        return data["server_state"]
 
     vm_["ssh_host"] = __utils__["cloud.wait_for_fun"](
         wait_for_hostname,
@@ -440,12 +478,17 @@ def create(vm_):
             "wait_for_fun_timeout", vm_, __opts__, default=15 * 60
         ),
     )
-    vm_["password"] = __utils__["cloud.wait_for_fun"](
-        wait_for_default_password,
-        timeout=config.get_cloud_config_value(
-            "wait_for_fun_timeout", vm_, __opts__, default=15 * 60
-        ),
-    )
+    if ssh_username:
+        vm_["ssh_username"] = ssh_username
+    if not password:
+        vm_["password"] = __utils__["cloud.wait_for_fun"](
+            wait_for_default_password,
+            timeout=config.get_cloud_config_value(
+                "wait_for_fun_timeout", vm_, __opts__, default=15 * 60
+            ),
+        )
+    else:
+        vm_["password"] = password
     __utils__["cloud.wait_for_fun"](
         wait_for_status,
         timeout=config.get_cloud_config_value(
