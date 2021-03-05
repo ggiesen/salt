@@ -74,15 +74,74 @@ You can list SSH keys available on your account using
 
     salt-cloud -f list_keypairs <name of vultr provider>
 
+.. versionadded:: 3004.0
+
+When using a custom image type (such as when you are installing from an ISO),
+you may specify ``ssh_username`` and ``password``to be used by Salt to saltify
+the instance. You may also specify 'isoid' to use select either a publicly-
+available ISO image or a custom ISO image present in your account; additionally
+you can define 'ipxe_chain_url' to specifiy the URL of an iPXE-compatible
+script to chainload.
+
+.. code-block:: yaml
+
+    tor-1gb-1cpu-custom:
+      location: 22
+      provider: my-vultr-config
+      image: 159
+      size: 201
+      ssh_username: 'root'
+      password: 'CorrectHorseBatteryStaple'
+      isoid: 641216
+      ipxe_chain_url: 'https://some.example.com/script.ipxe'
+
+You can list account-level ISO images with
+
+.. code-block:: bash
+
+    salt-cloud -f list_acct_isos <name of vultr provider>
+
+and public ISO images with
+
+.. code-block:: bash
+
+    salt-cloud -f list_public_isos <name of vultr provider>
+
+You may pass metadata using Vultr's metadata service to your instance by setting
+either ``userdata`` or ``userdata_file``. The value for ``userdata`` can be a
+string or a path to a file, in which case you can also optionally specify
+``userdata_template``, which sets the renderer to render the file with:
+
+.. code-block:: yaml
+
+    ams-64gb-16cpu-centos-8:
+      location: 7
+      provider: my-vultr-config
+      image: 362
+      size: 207
+      userdata: /srv/scripts/userdata.tmpl
+      userdata_template: jinja
+
 """
 
+import base64
 import logging
+import os.path
 import pprint
 import time
 import urllib.parse
 
 import salt.config as config
+import salt.utils.files
+import salt.utils.stringutils
 from salt.exceptions import SaltCloudConfigError, SaltCloudSystemExit
+
+try:
+    import validators
+
+    HAS_VALIDATORS = True
+except ImportError:
+    HAS_VALIDATORS = False
 
 # Get logging started
 log = logging.getLogger(__name__)
@@ -100,6 +159,16 @@ def __virtual__():
         return False
 
     return __virtualname__
+
+
+def get_dependencies():
+    """
+    Warn if dependencies aren't met.
+    """
+    deps = {
+        "validators": HAS_VALIDATORS,
+    }
+    return config.check_driver_dependencies(__virtualname__, deps)
 
 
 def get_configured_provider():
@@ -148,6 +217,42 @@ def avail_scripts(conn=None):
     return available startup scripts
     """
     return _query("startupscript/list")
+
+
+def avail_acct_isos(conn=None):
+    """
+    .. versionadded:: 3004.0
+
+    return available ISO images in account
+    """
+    return _query("iso/list")
+
+
+def list_acct_isos(conn=None, call=None):
+    """
+    .. versionadded:: 3004.0
+
+    return list of public ISO images
+    """
+    return avail_acct_isos()
+
+
+def avail_public_isos(conn=None):
+    """
+    .. versionadded:: 3004.0
+
+    return available public ISO images
+    """
+    return _query("iso/list_public")
+
+
+def list_public_isos(conn=None, call=None):
+    """
+    .. versionadded:: 3004.0
+
+    return list of ISO images in account
+    """
+    return avail_public_isos()
 
 
 def avail_firewall_groups(conn=None):
@@ -338,6 +443,14 @@ def create(vm_):
         "enable_private_network", vm_, __opts__, search_global=False, default=False,
     )
 
+    ssh_username = config.get_cloud_config_value(
+        "ssh_username", vm_, __opts__, search_global=False, default=False,
+    )
+
+    password = config.get_cloud_config_value(
+        "password", vm_, __opts__, search_global=False, default=False,
+    )
+
     ssh_key_ids = config.get_cloud_config_value(
         "ssh_key_names", vm_, __opts__, search_global=False, default=None
     )
@@ -346,12 +459,44 @@ def create(vm_):
         "startup_script_id", vm_, __opts__, search_global=False, default=None,
     )
 
+    isoid = config.get_cloud_config_value(
+        "isoid", vm_, __opts__, search_global=False, default=None,
+    )
+
     if startup_script and str(startup_script) not in avail_scripts():
         log.error(
             "Your Vultr account does not have a startup script with ID %s",
             str(startup_script),
         )
         return False
+
+    if (
+        isoid
+        and str(isoid) not in avail_acct_isos()
+        and str(isoid) not in avail_public_isos()
+    ):
+        log.error(
+            "Your Vultr account does not have an ISO image with ID %s and it does not match a public ISO image",
+            str(isoid),
+        )
+        return False
+
+    ipxe_chain_url = config.get_cloud_config_value(
+        "ipxe_chain_url", vm_, __opts__, search_global=False, default=False,
+    )
+
+    if ipxe_chain_url and not validators.url(str(ipxe_chain_url)):
+        log.error(
+            "iPXE Chain URL '%s' is malformed", str(ipxe_chain_url),
+        )
+        return False
+
+    userdata = config.get_cloud_config_value(
+        "userdata", vm_, __opts__, search_global=False, default=None
+    )
+    userdata_template = config.get_cloud_config_value(
+        "userdata_template", vm_, __opts__, search_global=False, default=None
+    )
 
     firewall_group_id = config.get_cloud_config_value(
         "firewall_group_id", vm_, __opts__, search_global=False, default=None,
@@ -363,6 +508,7 @@ def create(vm_):
             str(firewall_group_id),
         )
         return False
+
     if ssh_key_ids is not None:
         key_list = ssh_key_ids.split(",")
         available_keys = avail_keys()
@@ -417,6 +563,29 @@ def create(vm_):
     }
     if startup_script:
         kwargs["SCRIPTID"] = startup_script
+
+    if isoid:
+        kwargs["ISOID"] = isoid
+
+    if ipxe_chain_url:
+        kwargs["ipxe_chain_url"] = ipxe_chain_url
+
+    if userdata is not None and os.path.isfile(userdata):
+        try:
+            with __utils__["files.fopen"](userdata, "r") as fp_:
+                kwargs["userdata"] = __utils__["cloud.userdata_template"](
+                    __opts__, vm_, fp_.read()
+                )
+        except Exception as exc:  # pylint: disable=broad-except
+            log.exception("Failed to read userdata from %s: %s", userdata, exc)
+
+    if userdata is not None:
+        try:
+            kwargs["userdata"] = base64.b64encode(
+                salt.utils.stringutils.to_bytes(userdata)
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            log.exception("Failed to encode userdata: %s", exc)
 
     if firewall_group_id:
         kwargs["FIREWALLGROUPID"] = firewall_group_id
@@ -488,6 +657,7 @@ def create(vm_):
         Wait for the IP address to become available
         """
         data = show_instance(vm_["name"], call="action")
+        log.debug("Waiting for IP address to become available")
         main_ip = str(data.get("main_ip", "0"))
         if main_ip.startswith("0"):
             time.sleep(3)
@@ -499,8 +669,7 @@ def create(vm_):
         Wait for the IP address to become available
         """
         data = show_instance(vm_["name"], call="action")
-        # print("Waiting for default password")
-        # pprint.pprint(data)
+        log.debug("Waiting for default password")
         default_password = str(data.get("default_password", ""))
         if default_password == "" or default_password == "not supported":
             time.sleep(1)
@@ -512,8 +681,7 @@ def create(vm_):
         Wait for the IP address to become available
         """
         data = show_instance(vm_["name"], call="action")
-        # print("Waiting for status normal")
-        # pprint.pprint(data)
+        log.debug("Waiting for status normal")
         if str(data.get("status", "")) != "active":
             time.sleep(1)
             return False
@@ -524,8 +692,7 @@ def create(vm_):
         Wait for the IP address to become available
         """
         data = show_instance(vm_["name"], call="action")
-        # print("Waiting for server state ok")
-        # pprint.pprint(data)
+        log.debug("Waiting for server state ok")
         if str(data.get("server_state", "")) != "ok":
             time.sleep(1)
             return False
@@ -537,12 +704,17 @@ def create(vm_):
             "wait_for_fun_timeout", vm_, __opts__, default=15 * 60
         ),
     )
-    vm_["password"] = __utils__["cloud.wait_for_fun"](
-        wait_for_default_password,
-        timeout=config.get_cloud_config_value(
-            "wait_for_fun_timeout", vm_, __opts__, default=15 * 60
-        ),
-    )
+    if ssh_username:
+        vm_["ssh_username"] = ssh_username
+    if not password:
+        vm_["password"] = __utils__["cloud.wait_for_fun"](
+            wait_for_default_password,
+            timeout=config.get_cloud_config_value(
+                "wait_for_fun_timeout", vm_, __opts__, default=15 * 60
+            ),
+        )
+    else:
+        vm_["password"] = password
     __utils__["cloud.wait_for_fun"](
         wait_for_status,
         timeout=config.get_cloud_config_value(

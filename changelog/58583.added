@@ -1,0 +1,2 @@
+Add support for isoid, ssh_username, password, userdata, and ipxe_chain_url to
+the Vultr salt-cloud provider
