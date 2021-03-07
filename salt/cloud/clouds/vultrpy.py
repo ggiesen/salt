@@ -1,6 +1,6 @@
 """
-Vultr Cloud Module using python-vultr bindings
-==============================================
+Vultr Cloud Module
+==================
 
 .. versionadded:: 2016.3.0
 
@@ -74,14 +74,14 @@ You can list SSH keys available on your account using
 
     salt-cloud -f list_keypairs <name of vultr provider>
 
-.. versionadded:: 3004.0
-
 When using a custom image type (such as when you are installing from an ISO),
-you may specify ``ssh_username`` and ``password``to be used by Salt to saltify
-the instance. You may also specify 'isoid' to use select either a publicly-
+you may specify ``ssh_username`` and ``password`` to be used by Salt to saltify
+the instance. You may also specify ``isoid`` to use select either a publicly-
 available ISO image or a custom ISO image present in your account; additionally
-you can define 'ipxe_chain_url' to specifiy the URL of an iPXE-compatible
+you can define ``ipxe_chain_url`` to specifiy the URL of an iPXE-compatible
 script to chainload.
+
+.. versionadded:: 3004.0
 
 .. code-block:: yaml
 
@@ -173,7 +173,7 @@ def get_dependencies():
 
 def get_configured_provider():
     """
-    Return the first configured instance
+    Return the first configured instance.
     """
     return config.is_provider_configured(
         __opts__, __active_provider_name__ or "vultr", ("api_key",)
@@ -207,41 +207,55 @@ def _cache_provider_details(conn=None):
 
 def avail_locations(conn=None):
     """
-    return available datacenter locations
+    Return available datacenter locations.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud --list-locations my-vultr-config
     """
     return _query("regions/list")
 
 
 def avail_scripts(conn=None):
     """
-    return available startup scripts
+    Return list of available startup scripts.
     """
     return _query("startupscript/list")
 
 
 def avail_acct_isos(conn=None):
     """
+    Return list of available ISO images in account.
+
     .. versionadded:: 3004.0
 
-    return available ISO images in account
     """
     return _query("iso/list")
 
 
 def list_acct_isos(conn=None, call=None):
     """
+    Return list of available ISO images in account.
+
     .. versionadded:: 3004.0
 
-    return list of public ISO images
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud -f list_acct_isos my-vultr-config
     """
     return avail_acct_isos()
 
 
 def avail_public_isos(conn=None):
     """
-    .. versionadded:: 3004.0
+    Return list of available public ISO images.
 
-    return available public ISO images
+    .. versionadded:: 3004.0
+    
     """
     return _query("iso/list_public")
 
@@ -250,49 +264,94 @@ def list_public_isos(conn=None, call=None):
     """
     .. versionadded:: 3004.0
 
-    return list of ISO images in account
+    Return list of available public ISO images.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud -f list_public_isos my-vultr-config
     """
     return avail_public_isos()
 
 
 def avail_firewall_groups(conn=None):
     """
-    return available firewall groups
+    Return available firewall groups.
+
+    .. versionadded:: 3004.0
+
     """
     return _query("firewall/group_list")
 
 
 def avail_keys(conn=None):
     """
-    return available SSH keys
+    Return list of available SSH keys.
+
+    .. versionadded:: 3004.0
+    
     """
     return _query("sshkey/list")
 
 
 def list_scripts(conn=None, call=None):
     """
-    return list of Startup Scripts
+    Return list of startup scripts.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud -f list_scripts my-vultr-config
     """
     return avail_scripts()
 
 
 def list_firewall_groups(conn=None, call=None):
     """
-    return list of firewall groups
+    Return list of firewall groups.
+
+    .. versionadded:: 3004.0
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud -f list_firewall_groups my-vultr-config
     """
     return avail_firewall_groups()
 
 
 def list_keypairs(conn=None, call=None):
     """
-    return list of SSH keys
+    Return list of SSH keys.
+
+    .. versionadded:: 3004.0
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud -f list_keypairs my-vultr-config
     """
     return avail_keys()
 
 
 def show_keypair(kwargs=None, call=None):
     """
-    return list of SSH keys
+    Return list of SSH keys.
+
+    .. versionadded:: 3004.0
+
+    keyname
+        The SSHKEYID of the key to be shown.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud -f show_keypair my-vultr-config keyname="6043ec83f126a"
     """
     if not kwargs:
         kwargs = {}
@@ -310,21 +369,41 @@ def show_keypair(kwargs=None, call=None):
 
 def avail_sizes(conn=None):
     """
-    Return available sizes ("plans" in VultrSpeak)
+    Return available sizes ("plans").
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud --list-sizes my-vultr-config
     """
     return _query("plans/list")
 
 
 def avail_images(conn=None):
     """
-    Return available images
+    Return available images.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud --list-images my-vultr-config
     """
     return _query("os/list")
 
 
 def list_nodes(**kwargs):
     """
-    Return basic data on nodes
+    Returns a list of nodes ("instances"), keeping only a brief listing.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud -Q
+        salt-cloud --query
+        salt-cloud -f list_nodes my-vultr-config
     """
     ret = {}
 
@@ -339,7 +418,15 @@ def list_nodes(**kwargs):
 
 def list_nodes_full(**kwargs):
     """
-    Return all data on nodes
+    List nodes ("instances"), with all available information.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud -F
+        salt-cloud --full-query
+        salt-cloud -f list_nodes_full my-vultr-config
     """
     nodes = _query("server/list")
     ret = {}
@@ -359,7 +446,14 @@ def list_nodes_full(**kwargs):
 
 def list_nodes_select(conn=None, call=None):
     """
-    Return a list of the VMs that are on the provider, with select fields
+    Return a list of the nodes ("instances"), with selected
+    fields.
+
+    CLI Examples:
+
+    .. code-block:: bash
+
+        salt-cloud -S my-vultr-config
     """
     return __utils__["cloud.list_nodes_select"](
         list_nodes_full(), __opts__["query.selection"], call,
@@ -368,7 +462,17 @@ def list_nodes_select(conn=None, call=None):
 
 def destroy(name):
     """
-    Remove a node from Vultr
+    Destroys a node ("instance") by name. Either a name or a SUBID must
+    be provided.
+
+    name
+        The name of node to be destroyed.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud -d node_name
     """
     node = show_instance(name, call="action")
     params = {"SUBID": node["SUBID"]}
@@ -389,21 +493,51 @@ def destroy(name):
 
 def stop(*args, **kwargs):
     """
-    Execute a "stop" action on a VM
+    Execute a "stop" action on a node ("instance"). Either a name or a SUBID must
+    be provided.
+
+    name
+        The name of the node to stop.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud -a stop node_name
     """
     return _query("server/halt")
 
 
 def start(*args, **kwargs):
     """
-    Execute a "start" action on a VM
+    Execute a "start" action on a node ("instance"). Either a name or a SUBID must
+    be provided.
+
+    name
+        The name of the node to start. 
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud -a stop node_name
     """
     return _query("server/start")
 
 
 def show_instance(name, call=None):
     """
-    Show the details from the provider concerning an instance
+    Displays details about a particular instance. Either a name or a SUBID must
+    be provided.
+
+    name
+        The name of the node for which to display details.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud -a show_instance node_name
     """
     if call != "action":
         raise SaltCloudSystemExit(
@@ -434,7 +568,14 @@ def _lookup_vultrid(which_key, availkey, keyname):
 
 def create(vm_):
     """
-    Create a single VM from a data dict
+    Create a single instance from a data dict.
+
+    CLI Examples:
+
+    .. code-block:: bash
+
+        salt-cloud -p nyc-4gb-4cpu-ubuntu-14-04 host1
+        salt-cloud -m /path/to/mymap.sls -P
     """
     if "driver" not in vm_:
         vm_["driver"] = vm_["provider"]
