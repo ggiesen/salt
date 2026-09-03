@@ -464,11 +464,19 @@ def _terminate_subprocess_list(subprocess_list, signum, grace_seconds=2.0):
 
     if not salt.utils.platform.is_windows():
         for proc in procs:
+            # With ``multiprocessing: False`` the entries are
+            # ``threading.Thread`` objects, which have no ``pid`` and cannot be
+            # signalled.  Reading ``.pid`` there raises ``AttributeError``,
+            # which is not an ``OSError``, so it escaped and aborted the whole
+            # teardown before ``destroy()`` ever ran.
+            pid = getattr(proc, "pid", None)
+            if pid is None:
+                continue
             try:
-                os.kill(proc.pid, signum)
+                os.kill(pid, signum)
             except OSError as exc:
                 if exc.errno not in (errno.ESRCH, errno.EACCES):
-                    log.warning("Failed to signal job child pid %s: %s", proc.pid, exc)
+                    log.warning("Failed to signal job child pid %s: %s", pid, exc)
 
     deadline = time.time() + grace_seconds
     for proc in procs:
@@ -2212,6 +2220,7 @@ class Minion(MinionBase):
                 utils=self.utils,
                 notify=notify,
                 proxy=proxy,
+                loaded_base_name=self.loaded_base_name,
                 context=context,
             )
         returners = salt.loader.returners(opts, functions, proxy=proxy, context=context)
@@ -4142,14 +4151,18 @@ class Minion(MinionBase):
         # Cache locally so :meth:`_resolve_resource_targets` can resolve
         # ``tgt_type == "grain"`` without re-rendering.
         self._resource_grains_cache = resource_grains
-        load = {
-            "cmd": "_register_resources",
-            "id": self.opts["id"],
-            "resources": resources,
-            "resource_grains": resource_grains,
-            "tok": self.tok,
-        }
         try:
+            # Build the load inside the guard as well: this method is
+            # best-effort, so a problem assembling the request should be
+            # reported the same way a failure to send it is, rather than
+            # escaping into pillar_refresh and aborting the rest of it.
+            load = {
+                "cmd": "_register_resources",
+                "id": self.opts["id"],
+                "resources": resources,
+                "resource_grains": resource_grains,
+                "tok": self.tok,
+            }
             await self._send_req_async_main(load, timeout=self._return_retry_timer())
             log.debug("Registered resources with master: %s", list(resources.keys()))
         except Exception as err:  # pylint: disable=broad-except
@@ -6316,6 +6329,28 @@ class ProxyMinion(Minion):
         mp_call = _metaproxy_call(self.opts, "post_master_init")
         await mp_call(self, master)
 
+    async def subproxy_reconcile(self):
+        """
+        Bring the running sub-proxies into line with the pillar-declared list.
+
+        :rtype : None
+        """
+        mp_call = _metaproxy_call(self.opts, "subproxy_reconcile")
+        return await mp_call(self)
+
+    async def pillar_refresh(self, force_refresh=False, clean_cache=False):
+        """
+        Refresh the pillar, then converge on what it now declares.
+
+        ``Minion.pillar_refresh`` already reconciles the schedule, beacons,
+        matchers and resources that pillar declares.  A proxy's sub-proxy list
+        is declared the same way, so converge on it here too.
+        """
+        await super().pillar_refresh(
+            force_refresh=force_refresh, clean_cache=clean_cache
+        )
+        await self.subproxy_reconcile()
+
     async def subproxy_post_master_init(self, minion_id, uid):
         """
         Function to finish init for the sub proxies
@@ -6332,6 +6367,61 @@ class ProxyMinion(Minion):
         """
         mp_call = _metaproxy_call(self.opts, "tune_in")
         return mp_call(self, start)
+
+    def _shutdown_proxymodule(self):
+        """
+        Let this proxy's proxymodule close its connection to the device.
+
+        ``shutdown`` is a required part of the proxymodule contract -- a proxy
+        whose module lacks ``init`` or ``shutdown`` refuses to start -- and it
+        is where a module releases whatever it holds on the device: a NETCONF
+        session, an exclusive configuration lock, an API token.
+
+        The daemon has a separate call to this in
+        ``salt.cli.daemons.ProxyMinion.shutdown``, but it is reached only when
+        ``add_proxymodule_to_opts`` is set, which defaults to False, and it
+        uses the *control* proxy's opts so it never covers a deltaproxy's
+        sub-proxies.  Doing it here instead means every proxy releases its
+        device on the way down, sub-proxies included.
+        """
+        proxy = getattr(self, "proxy", None)
+        fq_proxyname = (self.opts.get("proxy") or {}).get("proxytype")
+        if proxy is None or not fq_proxyname:
+            return
+        shutdown_fn = f"{fq_proxyname}.shutdown"
+        if shutdown_fn not in proxy:
+            return
+        try:
+            proxy[shutdown_fn](self.opts)
+        except Exception:  # pylint: disable=broad-except
+            log.warning(
+                "Proxymodule for %s raised while shutting down",
+                self.opts.get("id"),
+                exc_info=True,
+            )
+
+    def destroy(self):
+        """
+        Tear down the proxy minion.
+
+        A deltaproxy holds its sub-proxies in ``deltaproxy_objs``, and each of
+        them owns its own ``req_channel``, schedule, beacons and periodic
+        callbacks.  Nothing used to tear those down, so every stop or restart
+        abandoned them.  Destroy the sub-proxies first, then release this
+        proxy's own device connection, then this minion.
+        """
+        subproxies = getattr(self, "deltaproxy_objs", None) or {}
+        for minion_id, _minion in list(subproxies.items()):
+            try:
+                _minion.destroy()
+            except Exception:  # pylint: disable=broad-except
+                log.warning(
+                    "Unable to tear down sub proxy %s", minion_id, exc_info=True
+                )
+        if subproxies:
+            subproxies.clear()
+        self._shutdown_proxymodule()
+        super().destroy()
 
     def _target_load(self, load):
         """

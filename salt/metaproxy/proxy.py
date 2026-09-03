@@ -56,6 +56,15 @@ from salt.utils.process import SignalHandlingProcess, default_signals
 log = logging.getLogger(__name__)
 
 
+async def subproxy_reconcile(self):
+    """
+    A single proxy minion hosts no sub-proxies, so there is nothing to
+    reconcile.  Defined so the metaproxy interface is uniform and callers do
+    not have to test which metaproxy is in use.
+    """
+    return
+
+
 async def post_master_init(self, master):
     """
     Function to finish init after a proxy
@@ -399,9 +408,10 @@ def thread_return(cls, minion_instance, opts, data):
     """
     fn_ = os.path.join(minion_instance.proc_dir, data["jid"])
 
-    salt.utils.process.appendproctitle(
-        "{}._thread_return {}".format(cls.__name__, data["jid"])
-    )
+    if opts.get("multiprocessing", True):
+        salt.utils.process.appendproctitle(
+            "{}._thread_return {}".format(cls.__name__, data["jid"])
+        )
 
     sdata = {"pid": os.getpid()}
     sdata.update(data)
@@ -634,9 +644,10 @@ def thread_multi_return(cls, minion_instance, opts, data):
     """
     fn_ = os.path.join(minion_instance.proc_dir, data["jid"])
 
-    salt.utils.process.appendproctitle(
-        "{}._thread_multi_return {}".format(cls.__name__, data["jid"])
-    )
+    if opts.get("multiprocessing", True):
+        salt.utils.process.appendproctitle(
+            "{}._thread_multi_return {}".format(cls.__name__, data["jid"])
+        )
 
     sdata = {"pid": os.getpid()}
     sdata.update(data)

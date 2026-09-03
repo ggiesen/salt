@@ -23,6 +23,7 @@ import salt.crypt
 import salt.defaults.exitcodes
 import salt.engines
 import salt.loader
+import salt.loader.lazy
 import salt.minion
 import salt.payload
 import salt.pillar
@@ -57,6 +58,137 @@ from salt.utils.event import tagify
 from salt.utils.process import SignalHandlingProcess, default_signals
 
 log = logging.getLogger(__name__)
+
+
+async def gather_subproxies(waitfor, ids):
+    """
+    Await every sub-proxy initialisation coroutine and return the results of
+    the ones that succeeded.
+
+    A sub-proxy that fails to initialise must not stop its siblings from
+    loading.  Without ``return_exceptions=True`` a single bad ``proxytype``
+    raises ``KeyError`` out of the proxy loader, propagates through
+    ``asyncio.gather``, and aborts the control proxy's ``post_master_init``,
+    which kills the salt-proxy daemon and takes every healthy sub-proxy down
+    with it.  The non-parallel startup path has always caught per sub-proxy
+    and carried on; this keeps the parallel path equivalent.
+    """
+    results = await asyncio.gather(*waitfor, return_exceptions=True)
+    collected = []
+    for _id, result in zip(ids, results):
+        if isinstance(result, BaseException):
+            log.error(
+                "An exception occured during initialization for %s, skipping: %s",
+                _id,
+                result,
+            )
+            continue
+        collected.append(result)
+    return collected
+
+
+def attach_req_channel(proxy_minion, proxy_opts, io_loop):
+    """
+    Give a sub-proxy its request channel, and the token that goes with it.
+
+    A sub-proxy is constructed directly rather than going through
+    ``connect_master``, which is where an ordinary minion picks up
+    ``self.tok``.  Without it every read of ``self.tok`` raises
+    ``AttributeError`` -- in practice from
+    ``_register_resources_with_master``, which ``pillar_refresh`` calls, so a
+    sub-proxy's resources never reach the master.  Derive the token from the
+    channel's auth the same way ``connect_master`` does.
+    """
+    proxy_minion.req_channel = salt.channel.client.AsyncReqChannel.factory(
+        proxy_opts, io_loop=io_loop
+    )
+    auth = getattr(proxy_minion.req_channel, "auth", None)
+    if auth is not None:
+        proxy_minion.tok = auth.gen_token(b"salt")
+    return proxy_minion.req_channel
+
+
+def _remove_subproxy(self, minion_id):
+    """
+    Shut down one sub-proxy and drop it from the control proxy.
+
+    ``ProxyMinion.destroy`` releases the proxymodule's connection to the device
+    before tearing down the minion's own channels, schedule and beacons, so a
+    removal here goes out the same way a stop does.
+    """
+    sub = self.deltaproxy_objs.pop(minion_id, None)
+    self.deltaproxy_opts.pop(minion_id, None)
+    if sub is None:
+        return
+
+    try:
+        sub.destroy()
+    except Exception:  # pylint: disable=broad-except
+        log.warning(
+            "Sub proxy %s raised while being torn down", minion_id, exc_info=True
+        )
+
+    log.info("Sub proxy %s removed without restarting the control proxy", minion_id)
+
+
+async def subproxy_reconcile(self):
+    """
+    Bring the running sub-proxies into line with the pillar-declared id list.
+
+    ``proxy:ids`` is declared in the control proxy's pillar, but until now the
+    only way to act on a change was to restart the control proxy -- which takes
+    every other sub-proxy down with it for the duration.  Salt already converges
+    schedule, beacons, matchers and resources when pillar is refreshed; this
+    does the same for the sub-proxy list.
+
+    A sub-proxy that is no longer declared is shut down and dropped.  Its
+    proxymodule's ``shutdown`` is called first so the module can close whatever
+    session it holds to the device: ``shutdown`` is a required part of the
+    proxymodule contract -- a proxy whose module lacks it refuses to start --
+    so it is always available to call here.
+    """
+    declared = (self.opts.get("pillar") or {}).get("proxy", {}).get("ids")
+    if not declared:
+        return
+
+    # Keep the opts view in step: handle_payload reads opts["proxy"]["ids"] on
+    # every publish to decide which sub-proxies a job fans out to.
+    self.opts.setdefault("proxy", {})["ids"] = list(declared)
+
+    for minion_id in [_id for _id in self.deltaproxy_objs if _id not in declared]:
+        _remove_subproxy(self, minion_id)
+
+    missing = [_id for _id in declared if _id not in self.deltaproxy_objs]
+    if not missing:
+        return
+
+    uid = salt.utils.user.get_uid(user=self.opts.get("user", None))
+    for minion_id in missing:
+        try:
+            sub_proxy_data = await subproxy_post_master_init(
+                minion_id, uid, self.opts, self.proxy, self.utils
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            log.error(
+                "An exception occured while adding sub proxy %s, skipping: %s",
+                minion_id,
+                exc,
+            )
+            continue
+
+        if not sub_proxy_data["proxy_minion"]:
+            log.warning("Sub proxy %s could not be loaded, skipping.", minion_id)
+            continue
+
+        self.deltaproxy_opts[minion_id] = sub_proxy_data["proxy_opts"]
+        self.deltaproxy_objs[minion_id] = sub_proxy_data["proxy_minion"]
+        attach_req_channel(
+            self.deltaproxy_objs[minion_id],
+            sub_proxy_data["proxy_opts"],
+            self.io_loop,
+        )
+        subproxy_tune_in(self.deltaproxy_objs[minion_id])
+        log.info("Sub proxy %s added without restarting the control proxy", minion_id)
 
 
 async def post_master_init(self, master):
@@ -97,16 +229,23 @@ async def post_master_init(self, master):
     if "proxy" not in self.opts:
         self.opts["proxy"] = self.opts["pillar"]["proxy"]
 
-    pillar = copy.deepcopy(self.opts["pillar"])
-    pillar.pop("master", None)
-    self.opts = salt.utils.dictupdate.merge(
-        self.opts,
-        pillar,
-        strategy=self.opts.get("proxy_merge_pillar_in_opts_strategy"),
-        merge_lists=self.opts.get("proxy_deep_merge_pillar_in_opts", False),
-    )
-
-    if self.opts.get("proxy_mines_pillar"):
+    if self.opts.get("proxy_merge_pillar_in_opts"):
+        # Override proxy opts with pillar data when the user required. But do
+        # not override master in opts.
+        #
+        # This is guarded in salt/metaproxy/proxy.py and was not here, so the
+        # documented option (default False) was ignored and the control proxy's
+        # pillar always won over its opts.  Sub-proxy opts start life as a copy
+        # of the control proxy's, so that leaked fleet-wide.
+        pillar = copy.deepcopy(self.opts["pillar"])
+        pillar.pop("master", None)
+        self.opts = salt.utils.dictupdate.merge(
+            self.opts,
+            pillar,
+            strategy=self.opts.get("proxy_merge_pillar_in_opts_strategy"),
+            merge_lists=self.opts.get("proxy_deep_merge_pillar_in_opts", False),
+        )
+    elif self.opts.get("proxy_mines_pillar"):
         # Even when not required, some details such as mine configuration
         # should be merged anyway whenever possible.
         if "mine_interval" in self.opts["pillar"]:
@@ -354,11 +493,7 @@ async def post_master_init(self, master):
                 )
             )
 
-        try:
-            results = await asyncio.gather(*waitfor)
-        except Exception as exc:  # pylint: disable=broad-except
-            log.error("Errors loading sub proxies: %s", exc)
-            raise
+        results = await gather_subproxies(waitfor, self.opts["proxy"].get("ids", []))
 
         _failed = self.opts["proxy"].get("ids", [])[:]
         for sub_proxy_data in results:
@@ -371,10 +506,10 @@ async def post_master_init(self, master):
                 self.deltaproxy_objs[minion_id] = sub_proxy_data["proxy_minion"]
 
                 if self.deltaproxy_opts[minion_id] and self.deltaproxy_objs[minion_id]:
-                    self.deltaproxy_objs[minion_id].req_channel = (
-                        salt.channel.client.AsyncReqChannel.factory(
-                            sub_proxy_data["proxy_opts"], io_loop=self.io_loop
-                        )
+                    attach_req_channel(
+                        self.deltaproxy_objs[minion_id],
+                        sub_proxy_data["proxy_opts"],
+                        self.io_loop,
                     )
     else:
         log.debug("Initiating non-parallel startup for proxies")
@@ -398,10 +533,10 @@ async def post_master_init(self, master):
                 self.deltaproxy_objs[minion_id] = sub_proxy_data["proxy_minion"]
 
                 if self.deltaproxy_opts[minion_id] and self.deltaproxy_objs[minion_id]:
-                    self.deltaproxy_objs[minion_id].req_channel = (
-                        salt.channel.client.AsyncReqChannel.factory(
-                            sub_proxy_data["proxy_opts"], io_loop=self.io_loop
-                        )
+                    attach_req_channel(
+                        self.deltaproxy_objs[minion_id],
+                        sub_proxy_data["proxy_opts"],
+                        self.io_loop,
                     )
 
     if _failed:
@@ -462,7 +597,15 @@ async def subproxy_post_master_init(minion_id, uid, opts, main_proxy, main_utils
         }
     )
 
-    _proxy_minion = ProxyMinion(proxyopts)
+    # Give every sub-proxy its own loader namespace.  Without this, all
+    # sub-proxies in a deltaproxy share one module namespace, so the loader
+    # hands them the *same* module objects and whichever sub-proxy packs a
+    # module last owns its ``__opts__`` for the life of the process.  See
+    # #70144.
+    _proxy_minion = ProxyMinion(
+        proxyopts,
+        loaded_base_name=f"{minion_id}.{salt.loader.lazy.LOADED_BASE_NAME}",
+    )
     _proxy_minion.proc_dir = salt.minion.get_proc_dir(proxyopts["cachedir"], uid=uid)
 
     # And load the modules
@@ -520,6 +663,15 @@ async def subproxy_post_master_init(minion_id, uid, opts, main_proxy, main_utils
     _proxy_minion.connected = True
 
     _fq_proxyname = proxyopts["proxy"]["proxytype"]
+
+    # A proxymodule may declare the executors its functions must run through.
+    # ``post_master_init`` reads this for the control proxy, but sub-proxies
+    # never had it set, so ``thread_return`` fell through to the opts default
+    # and the proxymodule's declaration was silently ignored for every
+    # sub-proxy.  The single-proxy metaproxy honours it.
+    _proxy_minion.module_executors = _proxy_minion.proxy.get(
+        f"{_fq_proxyname}.module_executors", lambda: []
+    )()
 
     proxy_init_fn = _proxy_minion.proxy[_fq_proxyname + ".init"]
     try:
@@ -627,17 +779,8 @@ def thread_return(cls, minion_instance, opts, data):
     """
     fn_ = os.path.join(minion_instance.proc_dir, data["jid"])
 
-    if opts["multiprocessing"] and not salt.utils.platform.spawning_platform():
-
-        # Shutdown the multiprocessing before daemonizing
-        salt._logging.shutdown_logging()
-
-        salt.utils.process.daemonize_if(opts)
-
-        # Reconfigure multiprocessing logging after daemonizing
-        salt._logging.setup_logging()
-
-    salt.utils.process.appendproctitle(f"{cls.__name__}._thread_return")
+    if opts.get("multiprocessing", True):
+        salt.utils.process.appendproctitle(f"{cls.__name__}._thread_return")
 
     sdata = {"pid": os.getpid()}
     sdata.update(data)
@@ -834,20 +977,29 @@ def thread_return(cls, minion_instance, opts, data):
 
     # Add default returners from minion config
     # Should have been coverted to comma-delimited string already
+    #
+    # ``data`` is the publish load, and ``handle_payload`` hands the *same*
+    # dict to the control proxy and to every sub-proxy the job matched.  With
+    # ``multiprocessing: False`` those all run as threads in one process, so
+    # writing the merged returner list back into ``data["ret"]`` leaks this
+    # sub-proxy's ``return`` config onto its siblings -- a sub-proxy with no
+    # returner configured would send its job return to another one's returner.
+    # Keep the merge local to this job.
+    job_returners = data["ret"]
     if isinstance(opts.get("return"), str):
-        if data["ret"]:
-            data["ret"] = ",".join((data["ret"], opts["return"]))
+        if job_returners:
+            job_returners = ",".join((job_returners, opts["return"]))
         else:
-            data["ret"] = opts["return"]
+            job_returners = opts["return"]
 
     # TODO: make a list? Seems odd to split it this late :/
-    if data["ret"] and isinstance(data["ret"], str):
+    if job_returners and isinstance(job_returners, str):
         if "ret_config" in data:
             ret["ret_config"] = data["ret_config"]
         if "ret_kwargs" in data:
             ret["ret_kwargs"] = data["ret_kwargs"]
         ret["id"] = opts["id"]
-        for returner in set(data["ret"].split(",")):
+        for returner in set(job_returners.split(",")):
             try:
                 returner_str = f"{returner}.returner"
                 if returner_str in minion_instance.returners:
@@ -872,16 +1024,8 @@ def thread_multi_return(cls, minion_instance, opts, data):
     """
     fn_ = os.path.join(minion_instance.proc_dir, data["jid"])
 
-    if opts["multiprocessing"] and not salt.utils.platform.spawning_platform():
-        # Shutdown the multiprocessing before daemonizing
-        salt._logging.shutdown_logging()
-
-        salt.utils.process.daemonize_if(opts)
-
-        # Reconfigure multiprocessing logging after daemonizing
-        salt._logging.setup_logging()
-
-    salt.utils.process.appendproctitle(f"{cls.__name__}._thread_multi_return")
+    if opts.get("multiprocessing", True):
+        salt.utils.process.appendproctitle(f"{cls.__name__}._thread_multi_return")
 
     sdata = {"pid": os.getpid()}
     sdata.update(data)
@@ -1167,15 +1311,34 @@ def threaded_subproxy_tune_in(proxy_minion):
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    return subproxy_tune_in(proxy_minion)
+    try:
+        return subproxy_tune_in(proxy_minion)
+    finally:
+        # The worker thread is about to go away.  Drop the throwaway loop
+        # instead of leaking its file descriptors for the life of the
+        # process, once per sub-proxy.
+        asyncio.set_event_loop(None)
+        loop.close()
 
 
 def subproxy_tune_in(proxy_minion, start=True):
     """
     Tunein sub proxy minions
     """
-    proxy_minion.setup_scheduler()
-    proxy_minion.setup_beacons()
-    proxy_minion.add_periodic_callback("cleanup", proxy_minion.cleanup_subprocesses)
+
+    def _start_periodics():
+        proxy_minion.setup_scheduler()
+        proxy_minion.setup_beacons()
+        proxy_minion.add_periodic_callback("cleanup", proxy_minion.cleanup_subprocesses)
+
+    # ``PeriodicCallback.start()`` binds to ``IOLoop.current()``.  Under
+    # ``parallel_startup`` this function runs on a ThreadPoolExecutor worker
+    # whose current loop is a throwaway that is never run, so starting the
+    # timers here would bind every one of them to a dead loop and the
+    # sub-proxy would silently get no schedule, no beacons and no subprocess
+    # cleanup.  Hand the registration to the sub-proxy's own io_loop -- the
+    # loop that is actually run -- via the thread-safe
+    # ``call_soon_threadsafe``, so the timers bind to that loop instead.
+    proxy_minion.io_loop.call_soon_threadsafe(_start_periodics)
     proxy_minion._state_run()
     return proxy_minion
