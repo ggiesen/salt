@@ -6349,6 +6349,12 @@ class ProxyMinion(Minion):
         await super().pillar_refresh(
             force_refresh=force_refresh, clean_cache=clean_cache
         )
+        # Only the control proxy owns sub-proxies.  A sub-proxy reaches this
+        # method too -- ``Minion.handle_event`` routes a ``pillar_refresh``
+        # carrying ``proxy_target`` straight to the sub-proxy instance -- and it
+        # has no ``deltaproxy_objs`` to reconcile.
+        if self.opts.get("subproxy"):
+            return
         await self.subproxy_reconcile()
 
     async def subproxy_post_master_init(self, minion_id, uid):
@@ -6384,6 +6390,8 @@ class ProxyMinion(Minion):
         sub-proxies.  Doing it here instead means every proxy releases its
         device on the way down, sub-proxies included.
         """
+        if getattr(self, "_proxymodule_shutdown", False):
+            return
         proxy = getattr(self, "proxy", None)
         fq_proxyname = (self.opts.get("proxy") or {}).get("proxytype")
         if proxy is None or not fq_proxyname:
@@ -6391,6 +6399,10 @@ class ProxyMinion(Minion):
         shutdown_fn = f"{fq_proxyname}.shutdown"
         if shutdown_fn not in proxy:
             return
+        # Set before the call, not after: ``Minion.__del__`` calls ``destroy``,
+        # so a proxymodule that raises here would otherwise be asked to shut
+        # down a second time while the object is being finalised.
+        self._proxymodule_shutdown = True
         try:
             proxy[shutdown_fn](self.opts)
         except Exception:  # pylint: disable=broad-except
