@@ -1,6 +1,7 @@
 import base64
 import pathlib
 import shutil
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -2970,3 +2971,84 @@ def test_exceptions_on_calling_load_pem_private_key(x509, pk_args):
     ):
         ret = x509.private_key_managed(**pk_args)
     _assert_pk_basic(ret, "rsa", passphrase="hunter1")
+
+
+@pytest.fixture
+def valid_cert_file(x509, cert_args, tmp_path):
+    cert_args["name"] = str(tmp_path / "valid.crt")
+    cert_args["days_valid"] = 90
+    x509.certificate_managed(**cert_args)
+    return cert_args["name"]
+
+
+def test_certificate_valid(x509, valid_cert_file):
+    """
+    A certificate that is valid now and well inside its window passes.
+    """
+    ret = x509.certificate_valid(valid_cert_file)
+    assert ret["result"] is True
+    assert ret["changes"] == {}
+    assert "valid until" in ret["comment"]
+
+
+def test_certificate_valid_days_remaining_satisfied(x509, valid_cert_file):
+    """
+    A 90 day certificate satisfies a 30 day requirement.
+    """
+    ret = x509.certificate_valid(valid_cert_file, days_remaining=30)
+    assert ret["result"] is True
+
+
+def test_certificate_valid_days_remaining_not_satisfied(x509, valid_cert_file):
+    """
+    The inverse: the same 90 day certificate must NOT satisfy a 120 day
+    requirement, otherwise days_remaining is not being honoured at all.
+    """
+    ret = x509.certificate_valid(valid_cert_file, days_remaining=120)
+    assert ret["result"] is False
+    assert ret["changes"] == {}
+    assert "within the requested 120 day(s)" in ret["comment"]
+
+
+def test_certificate_valid_expired(x509, cert_args, tmp_path):
+    """
+    An already-expired certificate fails.
+    """
+    cert_args["name"] = str(tmp_path / "expired.crt")
+    cert_args["not_before"] = "2009-01-01 00:00:00"
+    cert_args["not_after"] = "2009-01-03 13:37:42"
+    x509.certificate_managed(**cert_args)
+    ret = x509.certificate_valid(cert_args["name"])
+    assert ret["result"] is False
+    assert "expired at" in ret["comment"]
+
+
+def test_certificate_valid_not_yet_valid(x509, cert_args, tmp_path):
+    """
+    A certificate whose not_before is in the future fails, and is reported
+    as not-yet-valid rather than as expired.
+    """
+    not_before = (datetime.now(tz=timezone.utc) + timedelta(days=30)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    not_after = (datetime.now(tz=timezone.utc) + timedelta(days=60)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    cert_args["name"] = str(tmp_path / "future.crt")
+    cert_args["not_before"] = not_before
+    cert_args["not_after"] = not_after
+    x509.certificate_managed(**cert_args)
+    ret = x509.certificate_valid(cert_args["name"])
+    assert ret["result"] is False
+    assert "not yet valid" in ret["comment"]
+
+
+def test_certificate_valid_missing_file(x509, tmp_path):
+    """
+    A missing certificate fails the state instead of raising, which is what
+    makes this usable as a monitoring assertion.
+    """
+    ret = x509.certificate_valid(str(tmp_path / "does_not_exist.crt"))
+    assert ret["result"] is False
+    assert ret["changes"] == {}
+    assert ret["comment"]

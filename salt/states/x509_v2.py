@@ -609,6 +609,69 @@ def certificate_managed(
     return ret
 
 
+def certificate_valid(name, days_remaining=0):
+    """
+    Report whether a certificate is currently valid and will stay valid for a
+    given number of days. This state never creates, renews or modifies
+    anything, so it behaves identically with ``test=True``.
+
+    .. versionadded:: 3009.0
+
+    This is the read-only counterpart to
+    :py:func:`certificate_managed <salt.states.x509_v2.certificate_managed>`,
+    for certificates that are issued and renewed elsewhere and which Salt is
+    only asked to assert are still good.
+
+    name
+        The path to the certificate, or PEM-encoded certificate text.
+
+    days_remaining
+        Report a failure if the certificate expires within this many days.
+        Defaults to ``0``, which only requires it to be valid at the time of
+        the run.
+
+    .. code-block:: yaml
+
+        /etc/pki/tls/certs/www.example.com.crt:
+          x509.certificate_valid:
+            - days_remaining: 30
+    """
+    ret = {"name": name, "result": False, "changes": {}, "comment": ""}
+
+    try:
+        cert = __salt__["x509.read_certificate"](name)
+    except (CommandExecutionError, SaltInvocationError) as err:
+        ret["comment"] = str(err)
+        return ret
+
+    now = datetime.now(tz=timezone.utc)
+    not_before = datetime.strptime(cert["not_before"], x509util.TIME_FMT).replace(
+        tzinfo=timezone.utc
+    )
+    not_after = datetime.strptime(cert["not_after"], x509util.TIME_FMT).replace(
+        tzinfo=timezone.utc
+    )
+
+    if now < not_before:
+        ret["comment"] = (
+            f"Certificate is not yet valid, it becomes valid at {cert['not_before']}"
+        )
+        return ret
+    if now >= not_after:
+        ret["comment"] = f"Certificate expired at {cert['not_after']}"
+        return ret
+    if now + timedelta(days=days_remaining) >= not_after:
+        ret["comment"] = (
+            f"Certificate expires at {cert['not_after']}, which is within the "
+            f"requested {days_remaining} day(s)"
+        )
+        return ret
+
+    ret["result"] = True
+    ret["comment"] = f"Certificate is valid until {cert['not_after']}"
+    return ret
+
+
 def crl_managed(
     name,
     signing_private_key,
