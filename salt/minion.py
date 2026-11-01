@@ -126,7 +126,7 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 # How many mine sends a Minion keeps pending (in flight plus waiting) for
-# one master and minion ID.  See Minion._mine_send.
+# one master and the minion ID in the load.  See Minion._mine_send.
 _MINE_SEND_MAX_PENDING = 3
 
 
@@ -2162,8 +2162,9 @@ class Minion(MinionBase):
         self.jid_queue = [] if jid_queue is None else jid_queue
         self.periodic_callbacks = {}
         self.req_channel = None
-        # Per master URI and minion ID, the lock that orders mine sends and
-        # the number of sends in flight or waiting for it.  See _mine_send.
+        # Per master URI and opts["id"], the lock that orders mine sends,
+        # and per minion ID in the load the number of sends in flight or
+        # waiting for it.  See _mine_send.
         self._mine_send_locks = {}
         self._mine_send_pending = {}
         # Track when system resource limits are hit (EMFILE/ENFILE) to apply backpressure
@@ -4927,33 +4928,41 @@ class Minion(MinionBase):
         """
         Send mine data to the master
         """
-        # Sends for one minion ID go to a master one at a time, in the
-        # order the events arrived, so an older update can't land after a
-        # newer update or a delete.  While a master is down each send can
-        # take minutes, or with the TCP transport wait until the master is
-        # back, so once a few are pending new ones are dropped instead of
-        # piling up.
+        # Sends go to a master one at a time, in the order the events
+        # arrived, so an older update can't land after a newer update or a
+        # delete.  While a master is down a single send can take minutes or
+        # longer, so once a few are pending for one minion ID new ones are
+        # dropped instead of piling up.
+        #
+        # The lock is per opts["id"], not per ID in the load.  The channel
+        # sends every load under opts["id"], so the master keeps the mine
+        # data of a deltaproxy's sub-proxies in the control proxy's record,
+        # and two sends in flight at once can undo each other there.  The
+        # cap is per ID in the load, so a mine.update run on all the
+        # sub-proxies at once does not lose updates while the master is up.
         #
         # On failover eval_master points self.opts at the new master in
         # place.  Each send keeps a copy of the opts it came in with and
         # queues for that master, so sends still waiting on the old master
         # don't hold up the new one and don't reach it after newer data.
         opts = dict(self.opts)
+        key = (opts.get("master_uri"), opts["id"])
         minion_id = data.get("id") or opts["id"]
-        key = (opts.get("master_uri"), minion_id)
-        pending = self._mine_send_pending.get(key, 0)
-        if pending >= _MINE_SEND_MAX_PENDING:
+        pending = self._mine_send_pending.get(key, {})
+        count = pending.get(minion_id, 0)
+        if count >= _MINE_SEND_MAX_PENDING:
             log.warning(
                 "Not sending mine data for %s to master %s, %d earlier mine "
                 "sends are still pending.",
                 minion_id,
                 opts["master"],
-                pending,
+                count,
             )
             return None
         if not pending:
             self._mine_send_locks[key] = asyncio.Lock()
-        self._mine_send_pending[key] = pending + 1
+            self._mine_send_pending[key] = pending
+        pending[minion_id] = count + 1
         try:
             async with self._mine_send_locks[key]:
                 # Consider using a long-running req channel to send mine data
@@ -4971,9 +4980,18 @@ class Minion(MinionBase):
                     except SaltReqTimeoutError:
                         log.warning("Unable to send mine data to master.")
                         return None
+                    except SaltClientError as exc:
+                        # Usually signing in to the master again failed,
+                        # for example because it timed out while the
+                        # master is unreachable.  A reply whose nonce does
+                        # not match raises it too.
+                        log.warning("Unable to send mine data to master: %s", exc)
+                        return None
         finally:
-            self._mine_send_pending[key] -= 1
-            if not self._mine_send_pending[key]:
+            pending[minion_id] -= 1
+            if not pending[minion_id]:
+                del pending[minion_id]
+            if not pending:
                 del self._mine_send_pending[key]
                 del self._mine_send_locks[key]
 
