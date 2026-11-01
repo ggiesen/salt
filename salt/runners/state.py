@@ -66,6 +66,10 @@ def orchestrate(
     Execute a state run from the master, used as a powerful orchestration
     system.
 
+    Inside the orchestration, ``opts['user']`` and ``config.get('user')`` are
+    the master's configured user; the user that started the orchestration is
+    only used to attribute the jobs that ``salt.runner`` states start.
+
     .. seealso:: More Orchestrate documentation
 
         * :ref:`Full Orchestrate Tutorial <orchestrate-runner>`

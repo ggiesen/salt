@@ -439,9 +439,9 @@ def test_unknown_in_runner_event(
     event_listener,
 ):
     """
-    Runner and wheel jobs started by an orchestration run through eauth run as
-    the master's configured user, not as the eauth user (#70251), and the
-    runner jobs are attributed to the eauth user (#63148).
+    Runner and wheel jobs started by an orchestration run through eauth
+    succeed on a root master instead of dropping to the eauth user (#70251),
+    and the runner jobs are attributed to the eauth user (#63148).
     """
     test_orch_contents = """
     test_runner_metasyntetic:

@@ -1,8 +1,13 @@
 """
 ``state.sls`` gives state modules the user that started an orchestration as
 ``__user__`` by setting it in the State's ``inject_globals``, without changing
-``opts['user']`` (#63148, #70251). These tests check that a ``__user__`` set
-there reaches every chunk of the run, whichever way the chunk is called.
+``opts['user']`` (#63148, #70251). These tests cover the ``State.call`` side
+that ``state.sls`` relies on: a ``__user__`` set in ``inject_globals`` reaches
+every chunk of the run, whichever way the chunk is called. That code is older
+than the fix for #70251, so these tests also pass on code without the fix.
+``state.sls`` and ``state.orchestrate`` are tested in
+tests/pytests/unit/modules/test_state.py and
+tests/pytests/unit/runners/test_state.py.
 """
 
 import textwrap
