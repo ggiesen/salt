@@ -157,7 +157,10 @@ class SyncWrapper:
         the default executor of ``self.asyncio_loop``.
 
         Must be called from a thread with no running event loop, otherwise
-        ``run_until_complete`` raises and the tasks are left pending.
+        ``run_until_complete`` raises and the tasks are left pending.  It
+        returns only once every cancelled task has finished, the async
+        generators are closed and every job in the default executor has
+        returned; none of these waits has a timeout.
         """
         # Each of the three ``run_until_complete`` calls below takes a freshly
         # constructed coroutine object as its argument.  If the loop is already
@@ -251,7 +254,9 @@ class SyncWrapper:
             self._shutdown_asyncio_loop()
         else:
             # ``close()`` was called from code running on another event loop
-            # in this thread (e.g. ``Minion.handle_event`` -> ``_mine_send``).
+            # in this thread, i.e. a ``SyncWrapper`` such as a ``ReqChannel``
+            # used from a coroutine (in #70353, the synchronous ``_mine_send``
+            # called by ``Minion.handle_event``).
             # ``run_until_complete`` refuses to run ``self.asyncio_loop`` while
             # that loop is running, so the drain would fail and the loop would
             # be closed below with its cancelled tasks still pending.  Their
@@ -260,7 +265,9 @@ class SyncWrapper:
             # ``RequestClient.close_async``) are never closed, and the
             # ``_finalize_zmq_context`` finalizer later blocks in
             # ``zmq_ctx_term()`` (#70353).  Drain from a helper thread instead,
-            # the same way ``_wrap`` runs methods.
+            # the same way ``_wrap`` runs methods.  As with ``_wrap`` and the
+            # branch above, the caller (and so its loop) is blocked until the
+            # drain is done, including any job left in the default executor.
             thread = threading.Thread(target=self._shutdown_asyncio_loop)
             thread.start()
             thread.join()

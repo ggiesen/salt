@@ -301,7 +301,15 @@ class HelperHeldTask:
     ``AsyncAuth._authenticate`` task in #70353, which on Python 3.12+ is
     referenced by the ``asyncio.Timeout`` of the ``wait_for`` it is
     suspended in.
+
+    The attributes are slots because the reaper ignores referrers that are
+    containers.  Before Python 3.11, ``gc.get_referrers`` reports a plain
+    instance attribute as held by the instance ``__dict__``, a ``dict``, and
+    on 3.10 the reaper then cancels the task before ``close()`` is reached.
+    A slot is reported as held by the instance on every version.
     """
+
+    __slots__ = ("task", "cleaned_up")
 
     async_methods = [
         "start_background",
@@ -326,12 +334,12 @@ class HelperHeldTask:
 
 def test_close_from_running_loop_runs_pending_tasks_to_completion_70353():
     """
-    ``Minion.handle_event`` (a coroutine on the minion's loop) calls the
-    synchronous ``_mine_send``, which uses a ``SyncWrapper`` and closes it
-    while the minion's loop is running in the same thread.  ``close()``
-    cancelled the tasks left on the wrapper's loop but could not run that
-    loop to let them finish (``run_until_complete`` refuses to run while
-    another loop is running in the thread), then closed it.  The cancelled
+    In #70353, ``Minion.handle_event`` (a coroutine on the minion's loop)
+    called the synchronous ``_mine_send``, which used a ``SyncWrapper`` and
+    closed it while the minion's loop was running in the same thread.
+    ``close()`` cancelled the tasks left on the wrapper's loop but could not
+    run that loop to let them finish (``run_until_complete`` refuses to run
+    while another loop is running in the thread), then closed it.  The cancelled
     coroutines never resumed, so the ZMQ sockets they held were never closed
     and a later GC pass deadlocked the minion in ``zmq_ctx_term()``.
     """
