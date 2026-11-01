@@ -520,8 +520,8 @@ async def test_mine_sends_after_failover_do_not_wait_on_old_master(minion_opts):
 async def test_mine_sends_pending_for_one_minion_id_are_capped(minion_opts, caplog):
     """
     While the master is unreachable each mine send can take minutes.  Only a
-    few may be pending for one minion ID; newer ones are dropped with a
-    warning rather than queued or sent out of order.
+    few may be pending for one minion ID; newer mine updates are dropped
+    with a warning rather than queued or sent out of order.
     """
     cap = salt.minion._MINE_SEND_MAX_PENDING
     channels = _FakeMineChannels()
@@ -549,6 +549,46 @@ async def test_mine_sends_pending_for_one_minion_id_are_capped(minion_opts, capl
         await asyncio.gather(*tasks)
 
     assert [load["data"]["n"] for load in channels.started()] == list(range(cap))
+
+
+async def test_mine_delete_and_flush_are_queued_past_the_cap(minion_opts, caplog):
+    """
+    Nothing sends a mine.delete or mine.flush again, so if one were dropped
+    the master would keep the data it removes.  Past the cap they are still
+    queued, in order, while new mine updates are dropped.
+    """
+    cap = salt.minion._MINE_SEND_MAX_PENDING
+    channels = _FakeMineChannels()
+    minion_id = "minion1"
+    with _mine_test_minion(minion_opts, channels, minion_id) as minion:
+        channels.hold(minion_id)
+        packages = [_mine_event(minion_id, data={"n": n}) for n in range(cap)]
+        packages += [
+            _mine_event(minion_id, "_mine_delete", fun="f"),
+            _mine_event(minion_id, data={"n": cap}),
+            _mine_event(minion_id, "_mine_flush"),
+        ]
+        with caplog.at_level(logging.WARNING):
+            tasks = [
+                asyncio.create_task(minion.handle_event(package))
+                for package in packages
+            ]
+            await _run_ready_tasks()
+        dropped = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Not sending mine data")
+        ]
+        assert len(dropped) == 1
+        assert tasks[cap + 1].done()
+        channels.release(minion_id)
+        await asyncio.gather(*tasks)
+
+    assert [load["cmd"] for load in channels.started()] == ["_mine"] * cap + [
+        "_mine_delete",
+        "_mine_flush",
+    ]
+    assert [load["data"]["n"] for load in channels.started()[:cap]] == list(range(cap))
 
 
 async def test_mine_sends_for_sub_proxy_ids_are_ordered(minion_opts):

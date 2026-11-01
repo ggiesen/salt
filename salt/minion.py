@@ -126,7 +126,8 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 # How many mine sends a Minion keeps pending (in flight plus waiting) for
-# one master and the minion ID in the load.  See Minion._mine_send.
+# one master and the minion ID in the load before it drops new mine updates.
+# See Minion._mine_send.
 _MINE_SEND_MAX_PENDING = 3
 
 
@@ -4931,8 +4932,10 @@ class Minion(MinionBase):
         # Sends go to a master one at a time, in the order the events
         # arrived, so an older update can't land after a newer update or a
         # delete.  While a master is down a single send can take minutes or
-        # longer, so once a few are pending for one minion ID new ones are
-        # dropped instead of piling up.
+        # longer, so once a few are pending for one minion ID new mine
+        # updates for it are dropped instead of piling up.  mine.delete and
+        # mine.flush are always queued: nothing sends them again, so
+        # dropping one would leave the data it removes on the master.
         #
         # The lock is per opts["id"], not per ID in the load.  The channel
         # sends every load under opts["id"], so the master keeps the mine
@@ -4950,7 +4953,7 @@ class Minion(MinionBase):
         minion_id = data.get("id") or opts["id"]
         pending = self._mine_send_pending.get(key, {})
         count = pending.get(minion_id, 0)
-        if count >= _MINE_SEND_MAX_PENDING:
+        if count >= _MINE_SEND_MAX_PENDING and data.get("cmd") == "_mine":
             log.warning(
                 "Not sending mine data for %s to master %s, %d earlier mine "
                 "sends are still pending.",
